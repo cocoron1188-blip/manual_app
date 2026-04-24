@@ -1,7 +1,6 @@
 import streamlit as st
 import openai
 import os
-from dotenv import load_dotenv
 import base64
 from docx import Document 
 from docx.shared import Inches, Pt
@@ -12,11 +11,6 @@ import cv2
 import tempfile
 
 # --- 設定ファイルの読み込み ---
-env_path = os.path.join(os.path.dirname(__file__), '.env')
-if os.path.exists(env_path):
-    with open(env_path, encoding='utf-8') as f:
-        load_dotenv(stream=f, override=True)
-
 raw_api_key = os.getenv("OPENAI_API_KEY")
 if raw_api_key:
     openai.api_key = raw_api_key.strip().strip('"').strip("'")
