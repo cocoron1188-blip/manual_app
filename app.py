@@ -13,7 +13,12 @@ import re
 from datetime import datetime
 import cv2
 import tempfile
-import PyPDF2
+
+# PDF解析ライブラリのインポート（エラー回避策付き）
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
 
 # 1. 環境設定の読み込み
 load_dotenv()
@@ -367,6 +372,12 @@ def page_glossary_registration():
 
     with tab3:
         st.subheader("PDFから用語を自動抽出・登録")
+        
+        # PyPDF2が利用可能かチェック
+        if PyPDF2 is None:
+            st.error("⚠️ PDF解析ライブラリ(PyPDF2)がインストールされていません。requirements.txtに記載してデプロイし直してください。")
+            return
+
         st.write("参考書や資料などのPDFをアップロードすると、AIが重要な用語を読み取ってNotionに自動登録します。")
         st.caption("※PCのフォルダから複数のPDFをマウスで囲んで、一気にアップロードすることができます。")
         
