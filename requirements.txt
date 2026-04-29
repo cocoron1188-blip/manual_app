@@ -5,3 +5,4 @@ requests
 openai
 python-docx
 opencv-python-headless
+PyPDF2

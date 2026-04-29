@@ -13,6 +13,7 @@ import re
 from datetime import datetime
 import cv2
 import tempfile
+import PyPDF2
 
 # 1. 環境設定の読み込み
 load_dotenv()
@@ -160,7 +161,6 @@ def page_manual_creator():
                 st.warning("画像をアップロードしてください。")
             else:
                 with st.spinner("AIがマニュアルを作成中..."):
-                    # プロンプトの強化：フォーマット固定と手書き読み取り指示、免責事項の禁止
                     prompt_text = """
                     あなたはプロの業務マニュアル作成者です。提供された画像（[画像1], [画像2]...）を解析し、以下のルールでマニュアルを作成してください。
 
@@ -191,7 +191,7 @@ def page_manual_creator():
                             model="gpt-4o",
                             messages=[{"role": "user", "content": content_payload}],
                             max_tokens=2500,
-                            temperature=0.3, # 安定性を高めるため少し下げる
+                            temperature=0.3,
                         )
                         st.session_state['manual_text'] = response.choices[0].message.content
                     except Exception as e:
@@ -219,7 +219,6 @@ def page_manual_creator():
         title_line = lines[0].strip()
         title_name = title_line.replace("タイトル：", "").replace("タイトル:", "").strip()
         
-        # タイトルのフォールバック処理（謝罪やガイドラインが含まれていれば日付マニュアルにする）
         if not title_name or any(x in title_name for x in ["申し訳", "できません", "不明", "ガイドライン", "提供"]):
             doc_title = f"{datetime.now().strftime('%Y%m%d')}_業務マニュアル"
         else:
@@ -231,14 +230,12 @@ def page_manual_creator():
         col_res1, col_res2 = st.columns([3, 1])
         with col_res1: st.success("マニュアルが表示可能です。")
         with col_res2:
-            # Word生成ロジック
             doc = Document()
             doc.add_heading(doc_title, 0)
             for line in lines[1:]:
                 clean_line = line.strip()
                 if not clean_line: continue
                 
-                # 画像タグの検出
                 matches = re.findall(r'\[画像(\d+)\]', clean_line)
                 if matches:
                     for m in matches:
@@ -246,7 +243,6 @@ def page_manual_creator():
                         if 0 <= idx < len(st.session_state['processed_images_bytes']):
                             doc.add_picture(BytesIO(st.session_state['processed_images_bytes'][idx]), width=Inches(4.5))
                 else:
-                    # テキスト行（不要な行をスキップするフィルタ）
                     if "画像タグ" in clean_line and ":" in clean_line: continue
                     if "実際の操作手順は異なる場合" in clean_line or "画像の内容に基づいており" in clean_line: continue
                     
@@ -263,18 +259,15 @@ def page_manual_creator():
                 doc.add_heading("確認用チェックリスト", level=1)
                 for cl in st.session_state['checklist_text'].split('\n'):
                     clean_cl = cl.replace('**', '').replace('#', '').strip()
-                    # 不要なタイトルや前置きを弾く
                     if clean_cl and "確認用" not in clean_cl and "チェックリスト" not in clean_cl and "以下は" not in clean_cl:
                         if not clean_cl.startswith('□'): clean_cl = f"□ {clean_cl}"
                         p = doc.add_paragraph(clean_cl)
-                        # Wordでもチェックリストにインデントをつける
                         p.paragraph_format.left_indent = Inches(0.2)
             
             bio = BytesIO()
             doc.save(bio)
             st.download_button("📥 Wordファイルで保存", bio.getvalue(), file_name=f"{safe_file_name}.docx")
 
-        # プレビュー表示
         st.markdown(f"# {doc_title}")
         for line in lines[1:]:
             clean_line = line.strip()
@@ -289,14 +282,10 @@ def page_manual_creator():
                         with img_cols[idx]:
                             st.image(st.session_state['processed_images_bytes'][img_idx], width=300)
             else:
-                # 不要なメタ情報や免責事項を非表示にする
                 if "画像タグ" in clean_line and ":" in clean_line: continue
                 if "実際の操作手順は異なる場合" in clean_line or "画像の内容に基づいており" in clean_line: continue
                 
-                # マークダウンのハッシュタグなどを消してプレーンに
                 display_line = clean_line.replace('#', '').replace('**', '').strip()
-                
-                # 手順の行の文字サイズを枠線テキスト(1em)とタイトルの中間(1.15em)くらいにする
                 if display_line.startswith("手順"):
                     st.markdown(f"<div style='font-size: 1.15em; font-weight: bold; margin-top: 15px; margin-bottom: 5px;'>{display_line}</div>", unsafe_allow_html=True)
                 else:
@@ -313,10 +302,8 @@ def page_manual_creator():
                 
             for cl in st.session_state['checklist_text'].split('\n'):
                 c = cl.replace('**', '').replace('#', '').strip()
-                # 余分なタイトルや説明文を弾く
                 if c and "確認用" not in c and "チェックリスト" not in c and "以下は" not in c:
                     if not c.startswith('□'): c = f"□ {c}"
-                    # チェックリストを右にインデントして表示
                     st.markdown(f"<div style='margin-left: 1.5em; margin-bottom: 0.5em;'>{c}</div>", unsafe_allow_html=True)
 
 def page_glossary_search():
@@ -339,7 +326,7 @@ def page_glossary_search():
 def page_glossary_registration():
     st.header("📥 用語の登録")
     
-    tab1, tab2, tab3 = st.tabs(["手動入力", "一括登録（コピペ）", "PDF解析（準備中）"])
+    tab1, tab2, tab3 = st.tabs(["手動入力", "一括登録（コピペ）", "PDF解析"])
     
     with tab1:
         st.subheader("1件ずつ登録")
@@ -379,9 +366,94 @@ def page_glossary_registration():
                 st.warning("テキストを入力してください。")
 
     with tab3:
-        st.subheader("PDFから用語を抽出")
-        st.info("この機能は現在開発中です。将来的にPDFをアップロードするだけで自動的に用語と意味を抽出して登録できるようになります。")
-        st.file_uploader("PDFファイルをアップロード (将来用)", type="pdf", disabled=True)
+        st.subheader("PDFから用語を自動抽出・登録")
+        st.write("参考書や資料などのPDFをアップロードすると、AIが重要な用語を読み取ってNotionに自動登録します。")
+        st.caption("※PCのフォルダから複数のPDFをマウスで囲んで、一気にアップロードすることができます。")
+        
+        uploaded_pdfs = st.file_uploader("PDFファイルをアップロード（複数選択可）", type="pdf", accept_multiple_files=True)
+        
+        chunk_size = st.slider("1回あたりの解析ページ数", min_value=10, max_value=100, value=40, help="一度に数百ページを解析するとAIが用語を見落としやすくなります。推奨の30〜50ページ単位で自動分割して処理します。")
+        
+        if st.button("PDF解析と自動登録を開始"):
+            if not uploaded_pdfs:
+                st.warning("PDFファイルをアップロードしてください。")
+            elif not raw_api_key:
+                st.error("OpenAI API Keyが設定されていません。")
+            else:
+                total_files = len(uploaded_pdfs)
+                for idx, pdf_file in enumerate(uploaded_pdfs):
+                    st.markdown(f"**📄 {pdf_file.name}** の解析を開始します ({idx+1}/{total_files})")
+                    
+                    try:
+                        pdf_reader = PyPDF2.PdfReader(pdf_file)
+                        total_pages = len(pdf_reader.pages)
+                        st.info(f"総ページ数: {total_pages}ページ（{chunk_size}ページずつ分割して処理します）")
+                        
+                        progress_bar = st.progress(0)
+                        
+                        for i, start_page in enumerate(range(0, total_pages, chunk_size)):
+                            end_page = min(start_page + chunk_size, total_pages)
+                            with st.spinner(f"ページ {start_page+1} 〜 {end_page} を解析・登録中..."):
+                                
+                                text_chunk = ""
+                                for page_num in range(start_page, end_page):
+                                    extracted_text = pdf_reader.pages[page_num].extract_text()
+                                    if extracted_text:
+                                        text_chunk += extracted_text + "\n"
+                                
+                                if not text_chunk.strip():
+                                    st.warning(f"ページ {start_page+1}〜{end_page}: テキストを抽出できませんでした（スキャン画像などの可能性があります）。")
+                                    progress_bar.progress((end_page) / total_pages)
+                                    continue
+                                
+                                prompt = f"""
+                                以下のテキストから、重要な専門用語やキーワードを抽出し、その名称と意味を簡潔にまとめてください。
+                                出力は必ず以下のJSON形式のみで行ってください。他の文章や挨拶は一切含めないでください。
+                                {{
+                                    "terms": [
+                                        {{"名称": "用語名", "意味": "意味の説明"}},
+                                        ...
+                                    ]
+                                }}
+                                
+                                【テキスト】
+                                {text_chunk}
+                                """
+                                
+                                try:
+                                    response = openai.chat.completions.create(
+                                        model="gpt-4o-mini",
+                                        response_format={"type": "json_object"},
+                                        messages=[{"role": "user", "content": prompt}],
+                                        temperature=0.3
+                                    )
+                                    
+                                    result_json = json.loads(response.choices[0].message.content)
+                                    terms = result_json.get("terms", [])
+                                    
+                                    if terms:
+                                        success_count = 0
+                                        for term in terms:
+                                            name = term.get("名称", "").strip()
+                                            definition = term.get("意味", "").strip()
+                                            if name and definition:
+                                                ok, _ = add_to_notion(name, definition)
+                                                if ok: success_count += 1
+                                                
+                                        st.success(f"✅ ページ {start_page+1}〜{end_page}: {success_count}件の用語を登録しました！")
+                                    else:
+                                        st.info(f"ページ {start_page+1}〜{end_page}: 登録すべき用語は見つかりませんでした。")
+                                        
+                                except Exception as e:
+                                    st.error(f"AI解析エラー (ページ {start_page+1}〜{end_page}): {e}")
+                                
+                            progress_bar.progress((end_page) / total_pages)
+                            
+                    except Exception as e:
+                        st.error(f"ファイル読み込みエラー ({pdf_file.name}): {e}")
+                        
+                st.balloons()
+                st.success("🎉 すべてのPDFの解析とNotionへの登録が完了しました！")
 
 # --- メインレイアウト ---
 st.set_page_config(page_title="お仕事支援マルチツール", layout="wide")
