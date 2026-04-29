@@ -1,6 +1,7 @@
 streamlit
-google-generativeai
+notion-client
+python-dotenv
+requests
 openai
-Pillow
 python-docx
 opencv-python-headless
