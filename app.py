@@ -1,6 +1,10 @@
 import streamlit as st
-import openai
+from notion_client import Client
 import os
+from dotenv import load_dotenv
+import requests
+import json
+import openai
 import base64
 from docx import Document 
 from docx.shared import Inches, Pt
@@ -10,15 +14,17 @@ from datetime import datetime
 import cv2
 import tempfile
 
-# --- 設定ファイルの読み込み ---
+# 1. 環境設定の読み込み
+load_dotenv()
+NOTION_TOKEN = os.getenv("NOTION_API_KEY")
+DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 raw_api_key = os.getenv("OPENAI_API_KEY")
+
+# OpenAI API Keyの設定
 if raw_api_key:
     openai.api_key = raw_api_key.strip().strip('"').strip("'")
 
-st.set_page_config(page_title="AIマニュアル作成アシスタント V13", layout="wide")
-st.title("🚀 AIマニュアル作成アシスタント V13")
-
-# セッション状態の初期化
+# --- セッション状態の初期化 ---
 if 'manual_text' not in st.session_state:
     st.session_state['manual_text'] = ""
 if 'checklist_text' not in st.session_state:
@@ -28,67 +34,114 @@ if 'source_files' not in st.session_state:
 if 'processed_images_bytes' not in st.session_state:
     st.session_state['processed_images_bytes'] = []
 
+# Notionクライアントの初期化
+if "notion" not in st.session_state:
+    if NOTION_TOKEN:
+        try:
+            st.session_state.notion = Client(auth=NOTION_TOKEN)
+        except Exception:
+            st.session_state.notion = None
+    else:
+        st.session_state.notion = None
+
+# --- 共通関数 ---
+
 def encode_image(image_bytes):
     return base64.b64encode(image_bytes).decode('utf-8')
 
-# --- 画面構成 ---
-# 【変更】動画ファイル（mp4, mov）も許可するように変更
-uploaded_files = st.file_uploader("写真または動画をアップロード（順番通りに）", 
-                                  type=['png', 'jpg', 'jpeg', 'mp4', 'mov'], 
-                                  accept_multiple_files=True)
+def add_to_notion(name, definition):
+    if not st.session_state.notion or not DATABASE_ID:
+        return False, "Notion設定が不足しています"
+    try:
+        st.session_state.notion.pages.create(
+            parent={"database_id": DATABASE_ID},
+            properties={
+                "名称": {"title": [{"text": {"content": name.strip()}}]},
+                "意味": {"rich_text": [{"text": {"content": definition.strip()}}]}
+            }
+        )
+        return True, f"「{name}」を登録しました！"
+    except Exception as e:
+        return False, f"Notion登録エラー: {str(e)}"
 
-if uploaded_files != st.session_state['source_files']:
-    st.session_state['manual_text'] = ""
-    st.session_state['checklist_text'] = ""
-    st.session_state['source_files'] = uploaded_files
-    st.session_state['processed_images_bytes'] = [] # リセット
+def get_notion_data(search_query="", mode="名称のみ"):
+    if not NOTION_TOKEN or not DATABASE_ID:
+        return []
+    filter_data = None
+    if search_query:
+        if mode == "名称のみ":
+            filter_data = {"property": "名称", "title": {"contains": search_query}}
+        else:
+            filter_data = {
+                "or": [
+                    {"property": "名称", "title": {"contains": search_query}},
+                    {"property": "意味", "rich_text": {"contains": search_query}}
+                ]
+            }
+    payload = {}
+    if filter_data: payload["filter"] = filter_data
+    if not search_query:
+        payload["page_size"] = 5
+        payload["sorts"] = [{"timestamp": "created_time", "direction": "descending"}]
 
-if uploaded_files:
-    has_video = False
-    temp_processed_bytes = []
+    try:
+        if st.session_state.notion:
+            response = st.session_state.notion.databases.query(database_id=DATABASE_ID, **payload)
+            return response.get("results", [])
+    except Exception: pass
+    try:
+        url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
+        headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
+        res = requests.post(url, headers=headers, data=json.dumps(payload))
+        if res.status_code == 200: return res.json().get("results", [])
+    except Exception: pass
+    return []
+
+# --- 各ページのコンテンツ定義 ---
+
+def page_manual_creator():
+    st.header("📝 AIマニュアル作成アシスタント V13")
     
-    # ファイルの処理（画像はそのまま、動画は3秒ごとに抽出）
-    if not st.session_state['processed_images_bytes']:
-        with st.spinner("ファイルを読み込み・解析中...（動画の場合は数秒かかります）"):
-            for file in uploaded_files:
-                file_ext = file.name.split('.')[-1].lower()
-                
-                if file_ext in ['mp4', 'mov']:
-                    has_video = True
-                    st.video(file)
-                    st.info(f"🎥 動画「{file.name}」から3秒ごとに画像を自動抽出しています...")
-                    
-                    # 一時ファイルとして動画を保存（OpenCVで読み込むため）
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_ext}') as tfile:
-                        tfile.write(file.read())
-                        temp_path = tfile.name
+    uploaded_files = st.file_uploader("写真または動画をアップロード（順番通りに）", 
+                                      type=['png', 'jpg', 'jpeg', 'mp4', 'mov'], 
+                                      accept_multiple_files=True)
 
-                    # OpenCVで動画読み込み
-                    cap = cv2.VideoCapture(temp_path)
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    if fps == 0: fps = 30 # フォールバック
-                    frame_interval = int(fps * 3) # 3秒ごとのフレーム数
-                    
-                    count = 0
-                    while cap.isOpened():
-                        ret, frame = cap.read()
-                        if not ret:
-                            break
-                        # 3秒ごとのフレームを保存
-                        if count % frame_interval == 0:
-                            _, buffer = cv2.imencode('.jpg', frame)
-                            temp_processed_bytes.append(buffer.tobytes())
-                        count += 1
-                        
-                    cap.release()
-                    os.remove(temp_path) # 一時ファイルの削除
-                else:
-                    # 写真の場合はそのまま追加
-                    temp_processed_bytes.append(file.getvalue())
+    if uploaded_files:
+        current_file_names = [f.name for f in uploaded_files]
+        previous_file_names = [f.name for f in st.session_state['source_files']]
+        
+        if current_file_names != previous_file_names:
+            st.session_state['manual_text'] = ""
+            st.session_state['checklist_text'] = ""
+            st.session_state['source_files'] = uploaded_files
+            st.session_state['processed_images_bytes'] = []
             
-            st.session_state['processed_images_bytes'] = temp_processed_bytes
+            temp_processed_bytes = []
+            with st.spinner("ファイルを読み込み・解析中..."):
+                for file in uploaded_files:
+                    file_ext = file.name.split('.')[-1].lower()
+                    if file_ext in ['mp4', 'mov']:
+                        st.info(f"🎥 動画「{file.name}」から画像を抽出中...")
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_ext}') as tfile:
+                            tfile.write(file.read())
+                            temp_path = tfile.name
+                        cap = cv2.VideoCapture(temp_path)
+                        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                        frame_interval = int(fps * 3)
+                        count = 0
+                        while cap.isOpened():
+                            ret, frame = cap.read()
+                            if not ret: break
+                            if count % frame_interval == 0:
+                                _, buffer = cv2.imencode('.jpg', frame)
+                                temp_processed_bytes.append(buffer.tobytes())
+                            count += 1
+                        cap.release()
+                        os.remove(temp_path)
+                    else:
+                        temp_processed_bytes.append(file.getvalue())
+                st.session_state['processed_images_bytes'] = temp_processed_bytes
 
-    # 抽出・アップロードされたすべての画像をプレビュー表示
     if st.session_state['processed_images_bytes']:
         st.write("### 📸 AIが解析する画像リスト")
         col_pre = st.columns(min(len(st.session_state['processed_images_bytes']), 5))
@@ -96,7 +149,6 @@ if uploaded_files:
             with col_pre[idx % 5]:
                 st.image(img_bytes, caption=f"画像{idx+1}", width=150)
 
-    # ベース64エンコード（AI送信用）
     all_images_base64 = [encode_image(b) for b in st.session_state['processed_images_bytes']]
 
     st.markdown("---")
@@ -104,51 +156,46 @@ if uploaded_files:
     
     with col_btn1:
         if st.button("マニュアルを新規生成する", use_container_width=True):
-            # トークン制限の簡易チェック（画像が多すぎる場合の警告）
-            if len(all_images_base64) > 30:
-                st.warning("⚠️ 抽出された画像が30枚を超えています。AIの処理制限に引っかかる可能性があるため、少し時間がかかるかエラーになる場合があります。")
+            if not all_images_base64:
+                st.warning("画像をアップロードしてください。")
+            else:
+                with st.spinner("AIがマニュアルを作成中..."):
+                    # プロンプトの強化：フォーマット固定と手書き読み取り指示、免責事項の禁止
+                    prompt_text = """
+                    あなたはプロの業務マニュアル作成者です。提供された画像（[画像1], [画像2]...）を解析し、以下のルールでマニュアルを作成してください。
 
-            with st.spinner("AIがマニュアルを作成中..."):
-                # 動画が含まれていたかどうかでAIへの指示を自動分岐
-                has_video_in_session = any(f.name.split('.')[-1].lower() in ['mp4', 'mov'] for f in uploaded_files)
-                
-                if has_video_in_session:
-                    optimization_instruction = """
-                    【重要：動画からの抽出画像の最適化】
-                    提供されている画像群には、動画から一定間隔で自動抽出された連続写真が含まれています。視覚的に明確な変化がない（ほぼ同じ画面である）画像は、マニュアルの手順文や画像タグから自動的に除外し、代表的な1枚だけを採用しなさい。マニュアル全体をスッキリさせ、似たような画像が並ばないように配置しなさい。
-                    """
-                else:
-                    optimization_instruction = """
-                    【重要：画像の完全使用（写真モード）】
-                    提供されている画像はユーザーが意図して選定した写真です。似たような画像であっても勝手に省略・除外せず、必ずすべての画像（[画像1], [画像2]...）を適切な手順の箇所に配置しなさい。
-                    """
+                    ### 出力フォーマット構成
+                    1. 1行目：必ず「タイトル：[作業名]」のみを出力してください。挨拶や謝罪は絶対に入れないでください。
+                    2. 手順の記述：
+                       手順1：[画像から読み取った操作内容の記述]
+                       [画像1]
+                       
+                       手順2：[画像から読み取った操作内容の記述]
+                       [画像2]
+                       ...という形式で、すべての手順を記述してください。
 
-                content_payload = [{
-                    "type": "text", 
-                    "text": f"""
-                    提供された画像群から、業務マニュアルを作成してください。以下のルールを厳守してください：
-                    1. 1行目は「タイトル：[システム名や作業名]」としてください（判断不能なら「タイトル：不明」）。
-                    2. 手順は意味のある大きなまとまり（「1. システムの起動」「2. データチェック」など）でグループ化し、その中に具体的な手順を箇条書きで記載してください。
-                    3. グループ化された手順の最後に、そのステップで参照すべきすべての画像タグをまとめて記載してください。例：[画像1][画像2]
+                    ### 画像解析ルール
+                    - **優先順位**: 画像内に「○で囲まれた数字（①、②など）」がある場合は、その数字の順番を手順の番号として優先してください。
+                    - **重要事項**: 画像内に手書きのメモ、赤枠、○囲み、矢印などがある場合、その内容は必ず手順の中に「※重要：[内容]」として記述してください。
+                    - **メタ情報の排除**: 「画像タグ：」「: ファイル選択画面」「[画像1], [画像2]」といったリストだけの行は作成しないでください。必ず「手順X：」の直後に配置してください。
+                    - **構成**: 1つの手順に対して、対応する画像タグ（例：[画像1]）を1つ、必ずその手順のすぐ下に配置してください。
+                    - **免責事項・注意書きの絶対禁止**: 「画像の内容に基づいており実際の操作と異なる場合があります」「解析できませんでしたがガイドラインを提供します」などのAIとしての断り書き、謝罪、前置き、後書きは **絶対に** 出力しないでください。
+                    """
                     
-                    {optimization_instruction}
+                    content_payload = [{"type": "text", "text": prompt_text}]
+                    for img in all_images_base64:
+                        content_payload.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
 
-                    4. 手書き文字は【重要】として反映してください。
-                    """
-                }]
-                
-                for img in all_images_base64:
-                    content_payload.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
-
-                try:
-                    response = openai.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[{"role": "user", "content": content_payload}],
-                        max_tokens=2000,
-                    )
-                    st.session_state['manual_text'] = response.choices[0].message.content
-                except Exception as e:
-                    st.error(f"エラーが発生しました（画像が多すぎるか、通信エラーの可能性があります）: {e}")
+                    try:
+                        response = openai.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[{"role": "user", "content": content_payload}],
+                            max_tokens=2500,
+                            temperature=0.3, # 安定性を高めるため少し下げる
+                        )
+                        st.session_state['manual_text'] = response.choices[0].message.content
+                    except Exception as e:
+                        st.error(f"エラー: {e}")
 
     with col_btn2:
         if st.button("確認用チェックリストを作成", use_container_width=True):
@@ -156,136 +203,201 @@ if uploaded_files:
                 st.warning("先にマニュアルを生成してください。")
             else:
                 with st.spinner("チェックリストを分析中..."):
-                    content_payload = [{
-                        "type": "text", 
-                        "text": f"""
-                        以下のマニュアル内容に基づき、作業者がミスをしないための「確認用チェックリスト」を作成してください。
-                        
-                        【マニュアル内容】
-                        {st.session_state['manual_text']}
-                        
-                        【ルール】
-                        ・箇条書き形式で、確認すべき重要項目を抽出してください。
-                        ・印刷してペンでチェックできるよう、各項目の先頭は必ず「□ 」（四角記号と半角スペース）にしてください。Wordの箇条書き機能は不要です。
-                        """
-                    }]
                     try:
                         response = openai.chat.completions.create(
                             model="gpt-4o",
-                            messages=[{"role": "user", "content": content_payload}],
+                            messages=[{"role": "user", "content": f"以下のマニュアルに基づき、作業者がミスをしないための「確認用チェックリスト」を作成せよ。\n\n【ルール】\n・各項目の先頭は「□ 」にすること。\n・「確認用チェックリスト」というタイトルや、前置き・後書きの説明文（「以下はチェックリストです」など）は一切出力しないでください。\n・箇条書きのリスト部分のみを出力してください。\n\n{st.session_state['manual_text']}"}],
                             max_tokens=1000,
                         )
                         st.session_state['checklist_text'] = response.choices[0].message.content
                     except Exception as e:
                         st.error(f"エラー: {e}")
 
-# --- 結果表示とWord保存 ---
-if st.session_state['manual_text']:
-    lines = st.session_state['manual_text'].strip().split('\n')
-    first_line = lines[0].strip()
-    
-    title_name = first_line.replace("タイトル：", "").replace("タイトル:", "").replace('業務マニュアル：', '').strip()
-    today_str = datetime.now().strftime("%Y%m%d")
-    if not title_name or title_name == "不明" or len(title_name) > 30:
-        doc_title = f"{today_str}_業務マニュアル"
-    else:
-        doc_title = title_name
-
-    safe_file_name = re.sub(r'[\\/:*?"<>|]', '', doc_title)
-
-    col_res1, col_res2 = st.columns([3, 1])
-    with col_res1:
-        st.success("作成が完了しました。")
-    with col_res2:
-        # Word作成
-        doc = Document()
-        doc.add_heading(doc_title, 0)
+    # 結果表示
+    if st.session_state['manual_text']:
+        lines = st.session_state['manual_text'].strip().split('\n')
+        title_line = lines[0].strip()
+        title_name = title_line.replace("タイトル：", "").replace("タイトル:", "").strip()
         
-        for i in range(1, len(lines)):
-            line = lines[i]
-            matches = re.findall(r'\[画像(\d+)\]', line)
-            clean_line = re.sub(r'\[画像\d+\]', '', line).replace('**', '').replace('#', '').strip()
+        # タイトルのフォールバック処理（謝罪やガイドラインが含まれていれば日付マニュアルにする）
+        if not title_name or any(x in title_name for x in ["申し訳", "できません", "不明", "ガイドライン", "提供"]):
+            doc_title = f"{datetime.now().strftime('%Y%m%d')}_業務マニュアル"
+        else:
+            doc_title = title_name
+
+        safe_file_name = re.sub(r'[\\/:*?"<>|]', '', doc_title)
+
+        st.divider()
+        col_res1, col_res2 = st.columns([3, 1])
+        with col_res1: st.success("マニュアルが表示可能です。")
+        with col_res2:
+            # Word生成ロジック
+            doc = Document()
+            doc.add_heading(doc_title, 0)
+            for line in lines[1:]:
+                clean_line = line.strip()
+                if not clean_line: continue
+                
+                # 画像タグの検出
+                matches = re.findall(r'\[画像(\d+)\]', clean_line)
+                if matches:
+                    for m in matches:
+                        idx = int(m) - 1
+                        if 0 <= idx < len(st.session_state['processed_images_bytes']):
+                            doc.add_picture(BytesIO(st.session_state['processed_images_bytes'][idx]), width=Inches(4.5))
+                else:
+                    # テキスト行（不要な行をスキップするフィルタ）
+                    if "画像タグ" in clean_line and ":" in clean_line: continue
+                    if "実際の操作手順は異なる場合" in clean_line or "画像の内容に基づいており" in clean_line: continue
+                    
+                    clean_text = clean_line.replace('**', '').replace('#', '').strip()
+                    if clean_text:
+                        p = doc.add_paragraph()
+                        run = p.add_run(clean_text)
+                        if clean_text.startswith("手順"):
+                            run.bold = True
+                            run.font.size = Pt(12)
             
-            if clean_line: 
-                doc.add_paragraph(clean_line)
+            if st.session_state['checklist_text']:
+                doc.add_page_break()
+                doc.add_heading("確認用チェックリスト", level=1)
+                for cl in st.session_state['checklist_text'].split('\n'):
+                    clean_cl = cl.replace('**', '').replace('#', '').strip()
+                    # 不要なタイトルや前置きを弾く
+                    if clean_cl and "確認用" not in clean_cl and "チェックリスト" not in clean_cl and "以下は" not in clean_cl:
+                        if not clean_cl.startswith('□'): clean_cl = f"□ {clean_cl}"
+                        p = doc.add_paragraph(clean_cl)
+                        # Wordでもチェックリストにインデントをつける
+                        p.paragraph_format.left_indent = Inches(0.2)
             
-            # Wordファイルへの画像挿入ロジック（抽出された全画像リストから取得）
+            bio = BytesIO()
+            doc.save(bio)
+            st.download_button("📥 Wordファイルで保存", bio.getvalue(), file_name=f"{safe_file_name}.docx")
+
+        # プレビュー表示
+        st.markdown(f"# {doc_title}")
+        for line in lines[1:]:
+            clean_line = line.strip()
+            if not clean_line: continue
+            
+            matches = re.findall(r'\[画像(\d+)\]', clean_line)
             if matches:
-                for match in matches:
-                    img_idx = int(match) - 1
+                img_cols = st.columns(len(matches))
+                for idx, m in enumerate(matches):
+                    img_idx = int(m) - 1
                     if 0 <= img_idx < len(st.session_state['processed_images_bytes']):
-                        doc.add_picture(BytesIO(st.session_state['processed_images_bytes'][img_idx]), width=Inches(3.0))
+                        with img_cols[idx]:
+                            st.image(st.session_state['processed_images_bytes'][img_idx], width=300)
+            else:
+                # 不要なメタ情報や免責事項を非表示にする
+                if "画像タグ" in clean_line and ":" in clean_line: continue
+                if "実際の操作手順は異なる場合" in clean_line or "画像の内容に基づいており" in clean_line: continue
+                
+                # マークダウンのハッシュタグなどを消してプレーンに
+                display_line = clean_line.replace('#', '').replace('**', '').strip()
+                
+                # 手順の行の文字サイズを枠線テキスト(1em)とタイトルの中間(1.15em)くらいにする
+                if display_line.startswith("手順"):
+                    st.markdown(f"<div style='font-size: 1.15em; font-weight: bold; margin-top: 15px; margin-bottom: 5px;'>{display_line}</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown(display_line)
 
-        # --- チェックリスト追加 ---
         if st.session_state['checklist_text']:
-            doc.add_page_break()
-            doc.add_heading(f"{doc_title}：チェックリスト", level=1)
-            
-            doc.add_paragraph("----------------------------------------------------------------------------------------------------")
-            
-            table = doc.add_table(rows=1, cols=1)
-            table.style = 'Table Grid'
-            cell = table.cell(0, 0)
-            p = cell.paragraphs[0]
-            p.alignment = 1
+            st.divider()
+            st.markdown(f"## {doc_title}：チェックリスト")
+            st.markdown("""
+                <div style='border: 1px solid #ccc; padding: 5px 10px; margin-bottom: 15px; width: auto; display: inline-block; font-weight: bold;'>
+                    確認用チェックリスト
+                </div>
+                """, unsafe_allow_html=True)
+                
+            for cl in st.session_state['checklist_text'].split('\n'):
+                c = cl.replace('**', '').replace('#', '').strip()
+                # 余分なタイトルや説明文を弾く
+                if c and "確認用" not in c and "チェックリスト" not in c and "以下は" not in c:
+                    if not c.startswith('□'): c = f"□ {c}"
+                    # チェックリストを右にインデントして表示
+                    st.markdown(f"<div style='margin-left: 1.5em; margin-bottom: 0.5em;'>{c}</div>", unsafe_allow_html=True)
 
-            run = p.add_run("確認用チェックリスト")
-            run.bold = True
-            run.font.size = Pt(12)
-            
-            doc.add_paragraph("")
+def page_glossary_search():
+    st.header("🔍 用語検索")
+    col1, col2 = st.columns([3, 1])
+    with col1: q = st.text_input("検索ワード", placeholder="キーワードを入力...", key="search_input")
+    with col2: m = st.selectbox("検索対象", ["名称のみ", "全体（意味を含む）"], key="search_mode")
+    st.divider()
+    with st.spinner("取得中..."): items = get_notion_data(q, m)
+    if items:
+        for item in items:
+            try:
+                props = item.get("properties", {})
+                name = props.get("名称", {}).get("title", [])[0]["plain_text"]
+                definition = props.get("意味", {}).get("rich_text", [])[0]["plain_text"]
+                with st.expander(f"📌 {name}"):
+                    st.write(definition)
+            except: continue
 
-            check_lines = st.session_state['checklist_text'].split('\n')
-            for cl in check_lines:
-                clean_cl = cl.replace('**', '').replace('#', '').strip()
-                if clean_cl: 
-                    if not clean_cl.startswith('□'):
-                        clean_cl = f"□ {clean_cl}"
-                    doc.add_paragraph(clean_cl)
-
-        bio = BytesIO()
-        doc.save(bio)
-        st.download_button(label="📥 Wordファイルで保存", data=bio.getvalue(), file_name=f"{safe_file_name}.docx")
-
-    # プレビュー表示
-    st.markdown("---")
-    st.markdown(f"# {doc_title}")
-    for i in range(1, len(lines)):
-        line = lines[i]
-        matches = re.findall(r'\[画像(\d+)\]', line)
-        preview_text = re.sub(r'\[画像\d+\]', '', line).strip()
-        
-        if preview_text: 
-            st.markdown(preview_text)
-            
-        # プレビューへの画像挿入ロジック
-        if matches:
-            img_cols = st.columns(len(matches))
-            for idx, match in enumerate(matches):
-                img_idx = int(match) - 1
-                if 0 <= img_idx < len(st.session_state['processed_images_bytes']):
-                    with img_cols[idx]:
-                        st.image(st.session_state['processed_images_bytes'][img_idx], width=300)
+def page_glossary_registration():
+    st.header("📥 用語の登録")
     
-    # チェックリストのプレビュー
-    if st.session_state['checklist_text']:
-        st.markdown("---")
-        st.markdown(f"## {doc_title}：チェックリスト")
-        st.markdown("<hr style='border: 1px solid #ccc;'>", unsafe_allow_html=True)
+    tab1, tab2, tab3 = st.tabs(["手動入力", "一括登録（コピペ）", "PDF解析（準備中）"])
+    
+    with tab1:
+        st.subheader("1件ずつ登録")
+        with st.form("single_form", clear_on_submit=True):
+            name = st.text_input("用語の名称")
+            definition = st.text_area("意味・解説")
+            submitted = st.form_submit_button("Notionへ登録")
+            if submitted:
+                if name and definition:
+                    with st.spinner("登録中..."):
+                        success, msg = add_to_notion(name, definition)
+                        if success: st.success(msg)
+                        else: st.error(msg)
+                else:
+                    st.warning("名称と意味を入力してください。")
 
-        st.markdown("""
-        <div style='border: 1px solid #ccc; padding: 5px 10px; margin-bottom: 15px; width: fit-content; font-weight: bold; text-align: center; display: inline-block;'>
-            確認用チェックリスト
-        </div>
-        """, unsafe_allow_html=True)
+    with tab2:
+        st.subheader("一括登録")
+        st.write("「用語 > 意味」の形式で入力（※改行で複数を一括登録可）")
+        st.caption("※区切り記号は「>」または「＞」が使用可能です。")
+        bulk_text = st.text_area("貼り付けエリア", height=300, placeholder="API > アプリ間の窓口\nUI > ユーザーインターフェース")
         
-        check_lines = st.session_state['checklist_text'].split('\n')
-        preview_checklist = ""
-        for cl in check_lines:
-            clean_cl = cl.replace('**', '').replace('#', '').strip()
-            if clean_cl:
-                if not clean_cl.startswith('□'):
-                    clean_cl = f"□ {clean_cl}"
-                preview_checklist += f"{clean_cl}\n\n"
-        
-        st.markdown(preview_checklist)
+        if st.button("まとめて登録を実行"):
+            if bulk_text:
+                lines = bulk_text.strip().split("\n")
+                success_count = 0
+                with st.spinner("一括登録中..."):
+                    for line in lines:
+                        sep = ">" if ">" in line else "＞" if "＞" in line else None
+                        if sep:
+                            parts = line.split(sep, 1)
+                            if len(parts) == 2:
+                                ok, _ = add_to_notion(parts[0], parts[1])
+                                if ok: success_count += 1
+                st.success(f"{success_count}件登録しました。")
+            else:
+                st.warning("テキストを入力してください。")
+
+    with tab3:
+        st.subheader("PDFから用語を抽出")
+        st.info("この機能は現在開発中です。将来的にPDFをアップロードするだけで自動的に用語と意味を抽出して登録できるようになります。")
+        st.file_uploader("PDFファイルをアップロード (将来用)", type="pdf", disabled=True)
+
+# --- メインレイアウト ---
+st.set_page_config(page_title="お仕事支援マルチツール", layout="wide")
+
+with st.sidebar:
+    st.title("🛠️ Menu")
+    selection = st.radio("機能選択", ["AIマニュアル作成", "用語検索", "用語登録"])
+    st.divider()
+    if NOTION_TOKEN and DATABASE_ID: st.success("Notion Connected")
+    else: st.error("Notion Disconnected")
+    if raw_api_key: st.success("OpenAI Ready")
+    else: st.error("OpenAI API Key Missing")
+
+if selection == "AIマニュアル作成":
+    page_manual_creator()
+elif selection == "用語検索":
+    page_glossary_search()
+elif selection == "用語登録":
+    page_glossary_registration()
