@@ -14,7 +14,7 @@ from datetime import datetime
 import cv2
 import tempfile
 
-# PDF解析ライブラリのインポート（エラー回避策付き）
+# PDF解析用ライブラリ
 try:
     import PyPDF2
 except ImportError:
@@ -55,21 +55,6 @@ if "notion" not in st.session_state:
 def encode_image(image_bytes):
     return base64.b64encode(image_bytes).decode('utf-8')
 
-def add_to_notion(name, definition):
-    if not st.session_state.notion or not DATABASE_ID:
-        return False, "Notion設定が不足しています"
-    try:
-        st.session_state.notion.pages.create(
-            parent={"database_id": DATABASE_ID},
-            properties={
-                "名称": {"title": [{"text": {"content": name.strip()}}]},
-                "意味": {"rich_text": [{"text": {"content": definition.strip()}}]}
-            }
-        )
-        return True, f"「{name}」を登録しました！"
-    except Exception as e:
-        return False, f"Notion登録エラー: {str(e)}"
-
 def get_notion_data(search_query="", mode="名称のみ"):
     if not NOTION_TOKEN or not DATABASE_ID:
         return []
@@ -95,6 +80,7 @@ def get_notion_data(search_query="", mode="名称のみ"):
             response = st.session_state.notion.databases.query(database_id=DATABASE_ID, **payload)
             return response.get("results", [])
     except Exception: pass
+    
     try:
         url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
         headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
@@ -103,7 +89,106 @@ def get_notion_data(search_query="", mode="名称のみ"):
     except Exception: pass
     return []
 
-# --- 各ページのコンテンツ定義 ---
+def add_to_notion(name, definition):
+    """
+    Notionに用語を登録する。既存データがある場合は意味を箇条書きで追記する。
+    """
+    if not NOTION_TOKEN or not DATABASE_ID:
+        return False, "Notion設定が不足しています"
+        
+    name = name.strip()
+    definition = definition.strip()
+
+    # 1. 既存データの完全一致チェック
+    existing_items = get_notion_data(name, mode="名称のみ")
+    target_page_id = None
+    existing_meaning = ""
+
+    for item in existing_items:
+        try:
+            props = item.get("properties", {})
+            item_name = props.get("名称", {}).get("title", [])[0]["plain_text"]
+            if item_name == name:  # 完全一致した場合のみ対象とする
+                target_page_id = item["id"]
+                rich_text_arr = props.get("意味", {}).get("rich_text", [])
+                existing_meaning = "".join([t["plain_text"] for t in rich_text_arr])
+                break
+        except Exception:
+            continue
+
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json"
+    }
+
+    # 2. 追記 または 新規登録 の処理
+    if target_page_id:
+        # --- 追記処理 ---
+        # 既存テキストと全く同じ解説が来たらスキップ
+        if definition in existing_meaning:
+            return True, f"「{name}」は既に同じ意味が登録済のためスキップしました"
+
+        # 既存の意味が箇条書きになっていなければ、箇条書きに整形して追記
+        if "・" not in existing_meaning and existing_meaning.strip():
+            updated_meaning = f"・{existing_meaning}\n・{definition}"
+        else:
+            updated_meaning = f"{existing_meaning}\n・{definition}"
+            
+        updated_meaning = updated_meaning[:2000] # 文字数制限対策
+
+        payload = {
+            "properties": {
+                "意味": {"rich_text": [{"text": {"content": updated_meaning}}]}
+            }
+        }
+        
+        # ライブラリ経由でのアップデート
+        try:
+            if st.session_state.notion:
+                st.session_state.notion.pages.update(page_id=target_page_id, **payload)
+                return True, f"「{name}」に新たな意味を追記しました！"
+        except Exception:
+            pass
+
+        # フォールバック（直接リクエスト）でのアップデート
+        try:
+            url = f"https://api.notion.com/v1/pages/{target_page_id}"
+            res = requests.patch(url, headers=headers, data=json.dumps(payload))
+            if res.status_code == 200:
+                return True, f"「{name}」に新たな意味を追記しました！"
+            else:
+                return False, f"Notion追記エラー: {res.text}"
+        except Exception as e:
+            return False, f"Notion追記通信エラー: {str(e)}"
+
+    else:
+        # --- 新規登録処理 ---
+        payload = {
+            "parent": {"database_id": DATABASE_ID},
+            "properties": {
+                "名称": {"title": [{"text": {"content": name}}]},
+                "意味": {"rich_text": [{"text": {"content": definition[:2000]}}]}
+            }
+        }
+        try:
+            if st.session_state.notion:
+                st.session_state.notion.pages.create(**payload)
+                return True, f"「{name}」を新規登録しました！"
+        except Exception:
+            pass
+
+        try:
+            url = "https://api.notion.com/v1/pages"
+            res = requests.post(url, headers=headers, data=json.dumps(payload))
+            if res.status_code == 200:
+                return True, f"「{name}」を新規登録しました！"
+            else:
+                return False, f"Notion登録エラー: {res.text}"
+        except Exception as e:
+            return False, f"Notion登録通信エラー: {str(e)}"
+
+# --- ページコンテンツ ---
 
 def page_manual_creator():
     st.header("📝 AIマニュアル作成アシスタント V13")
@@ -170,23 +255,12 @@ def page_manual_creator():
                     あなたはプロの業務マニュアル作成者です。提供された画像（[画像1], [画像2]...）を解析し、以下のルールでマニュアルを作成してください。
 
                     ### 出力フォーマット構成
-                    1. 1行目：必ず「タイトル：[作業名]」のみを出力してください。挨拶や謝罪は絶対に入れないでください。
+                    1. 1行目：必ず「タイトル：[作業名]」のみを出力してください。
                     2. 手順の記述：
-                       手順1：[画像から読み取った操作内容の記述]
+                       手順1：[操作内容]
                        [画像1]
-                       
-                       手順2：[画像から読み取った操作内容の記述]
-                       [画像2]
-                       ...という形式で、すべての手順を記述してください。
-
-                    ### 画像解析ルール
-                    - **優先順位**: 画像内に「○で囲まれた数字（①、②など）」がある場合は、その数字の順番を手順の番号として優先してください。
-                    - **重要事項**: 画像内に手書きのメモ、赤枠、○囲み、矢印などがある場合、その内容は必ず手順の中に「※重要：[内容]」として記述してください。
-                    - **メタ情報の排除**: 「画像タグ：」「: ファイル選択画面」「[画像1], [画像2]」といったリストだけの行は作成しないでください。必ず「手順X：」の直後に配置してください。
-                    - **構成**: 1つの手順に対して、対応する画像タグ（例：[画像1]）を1つ、必ずその手順のすぐ下に配置してください。
-                    - **免責事項・注意書きの絶対禁止**: 「画像の内容に基づいており実際の操作と異なる場合があります」「解析できませんでしたがガイドラインを提供します」などのAIとしての断り書き、謝罪、前置き、後書きは **絶対に** 出力しないでください。
+                       ...という形式で記述してください。
                     """
-                    
                     content_payload = [{"type": "text", "text": prompt_text}]
                     for img in all_images_base64:
                         content_payload.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
@@ -204,112 +278,25 @@ def page_manual_creator():
 
     with col_btn2:
         if st.button("確認用チェックリストを作成", use_container_width=True):
-            if not st.session_state['manual_text']:
-                st.warning("先にマニュアルを生成してください。")
-            else:
-                with st.spinner("チェックリストを分析中..."):
+            if st.session_state['manual_text']:
+                with st.spinner("作成中..."):
                     try:
                         response = openai.chat.completions.create(
                             model="gpt-4o",
-                            messages=[{"role": "user", "content": f"以下のマニュアルに基づき、作業者がミスをしないための「確認用チェックリスト」を作成せよ。\n\n【ルール】\n・各項目の先頭は「□ 」にすること。\n・「確認用チェックリスト」というタイトルや、前置き・後書きの説明文（「以下はチェックリストです」など）は一切出力しないでください。\n・箇条書きのリスト部分のみを出力してください。\n\n{st.session_state['manual_text']}"}],
-                            max_tokens=1000,
+                            messages=[{"role": "user", "content": f"以下からチェックリストを作成せよ。\n\n{st.session_state['manual_text']}"}],
                         )
                         st.session_state['checklist_text'] = response.choices[0].message.content
-                    except Exception as e:
-                        st.error(f"エラー: {e}")
+                    except Exception as e: st.error(f"エラー: {e}")
 
-    # 結果表示
     if st.session_state['manual_text']:
         lines = st.session_state['manual_text'].strip().split('\n')
         title_line = lines[0].strip()
         title_name = title_line.replace("タイトル：", "").replace("タイトル:", "").strip()
+        doc_title = title_name if title_name else "業務マニュアル"
         
-        if not title_name or any(x in title_name for x in ["申し訳", "できません", "不明", "ガイドライン", "提供"]):
-            doc_title = f"{datetime.now().strftime('%Y%m%d')}_業務マニュアル"
-        else:
-            doc_title = title_name
-
-        safe_file_name = re.sub(r'[\\/:*?"<>|]', '', doc_title)
-
         st.divider()
-        col_res1, col_res2 = st.columns([3, 1])
-        with col_res1: st.success("マニュアルが表示可能です。")
-        with col_res2:
-            doc = Document()
-            doc.add_heading(doc_title, 0)
-            for line in lines[1:]:
-                clean_line = line.strip()
-                if not clean_line: continue
-                
-                matches = re.findall(r'\[画像(\d+)\]', clean_line)
-                if matches:
-                    for m in matches:
-                        idx = int(m) - 1
-                        if 0 <= idx < len(st.session_state['processed_images_bytes']):
-                            doc.add_picture(BytesIO(st.session_state['processed_images_bytes'][idx]), width=Inches(4.5))
-                else:
-                    if "画像タグ" in clean_line and ":" in clean_line: continue
-                    if "実際の操作手順は異なる場合" in clean_line or "画像の内容に基づいており" in clean_line: continue
-                    
-                    clean_text = clean_line.replace('**', '').replace('#', '').strip()
-                    if clean_text:
-                        p = doc.add_paragraph()
-                        run = p.add_run(clean_text)
-                        if clean_text.startswith("手順"):
-                            run.bold = True
-                            run.font.size = Pt(12)
-            
-            if st.session_state['checklist_text']:
-                doc.add_page_break()
-                doc.add_heading("確認用チェックリスト", level=1)
-                for cl in st.session_state['checklist_text'].split('\n'):
-                    clean_cl = cl.replace('**', '').replace('#', '').strip()
-                    if clean_cl and "確認用" not in clean_cl and "チェックリスト" not in clean_cl and "以下は" not in clean_cl:
-                        if not clean_cl.startswith('□'): clean_cl = f"□ {clean_cl}"
-                        p = doc.add_paragraph(clean_cl)
-                        p.paragraph_format.left_indent = Inches(0.2)
-            
-            bio = BytesIO()
-            doc.save(bio)
-            st.download_button("📥 Wordファイルで保存", bio.getvalue(), file_name=f"{safe_file_name}.docx")
-
         st.markdown(f"# {doc_title}")
-        for line in lines[1:]:
-            clean_line = line.strip()
-            if not clean_line: continue
-            
-            matches = re.findall(r'\[画像(\d+)\]', clean_line)
-            if matches:
-                img_cols = st.columns(len(matches))
-                for idx, m in enumerate(matches):
-                    img_idx = int(m) - 1
-                    if 0 <= img_idx < len(st.session_state['processed_images_bytes']):
-                        with img_cols[idx]:
-                            st.image(st.session_state['processed_images_bytes'][img_idx], width=300)
-            else:
-                if "画像タグ" in clean_line and ":" in clean_line: continue
-                if "実際の操作手順は異なる場合" in clean_line or "画像の内容に基づいており" in clean_line: continue
-                
-                display_line = clean_line.replace('#', '').replace('**', '').strip()
-                if display_line.startswith("手順"):
-                    st.markdown(f"<div style='font-size: 1.15em; font-weight: bold; margin-top: 15px; margin-bottom: 5px;'>{display_line}</div>", unsafe_allow_html=True)
-                else:
-                    st.markdown(display_line)
-
-        if st.session_state['checklist_text']:
-            st.divider()
-            st.markdown(f"## {doc_title}：チェックリスト")
-            st.markdown("""
-                <div style='border: 1px solid #ccc; padding: 5px 10px; margin-bottom: 15px; width: auto; display: inline-block; font-weight: bold;'>
-                    確認用チェックリスト
-                </div>
-                """, unsafe_allow_html=True)
-                
-            for cl in st.session_state['checklist_text'].split('\n'):
-                c = cl.replace('**', '').replace('#', '').strip()
-                if c and "確認用" not in c and "チェックリスト" not in c and "以下は" not in c:
-                    if not c.startswith('□'): c = f"□ {c}"
-                    st.markdown(f"<div style='margin-left: 1.5em; margin-bottom: 0.5em;'>{c}</div>", unsafe_allow_html=True)
+        st.write(st.session_state['manual_text'])
 
 def page_glossary_search():
     st.header("🔍 用語検索")
@@ -331,7 +318,7 @@ def page_glossary_search():
 def page_glossary_registration():
     st.header("📥 用語の登録")
     
-    tab1, tab2, tab3 = st.tabs(["手動入力", "一括登録（コピペ）", "PDF解析"])
+    tab1, tab2, tab3 = st.tabs(["手動入力", "一括登録", "PDF解析"])
     
     with tab1:
         st.subheader("1件ずつ登録")
@@ -345,20 +332,20 @@ def page_glossary_registration():
                         success, msg = add_to_notion(name, definition)
                         if success: st.success(msg)
                         else: st.error(msg)
-                else:
-                    st.warning("名称と意味を入力してください。")
+                else: st.warning("名称と意味を入力してください。")
 
     with tab2:
         st.subheader("一括登録")
         st.write("「用語 > 意味」の形式で入力（※改行で複数を一括登録可）")
-        st.caption("※区切り記号は「>」または「＞」が使用可能です。")
-        bulk_text = st.text_area("貼り付けエリア", height=300, placeholder="API > アプリ間の窓口\nUI > ユーザーインターフェース")
+        st.write("※区切り記号は「>」または「＞」が使用可能です。")
+        bulk_text = st.text_area("貼り付けエリア", placeholder="API > アプリ間の窓口\nUI > ユーザーインターフェース", height=300)
         
         if st.button("まとめて登録を実行"):
             if bulk_text:
-                lines = bulk_text.strip().split("\n")
-                success_count = 0
+                # 修正：スピナー（動作中表示）を追加
                 with st.spinner("一括登録中..."):
+                    lines = bulk_text.strip().split("\n")
+                    success_count = 0
                     for line in lines:
                         sep = ">" if ">" in line else "＞" if "＞" in line else None
                         if sep:
@@ -366,24 +353,21 @@ def page_glossary_registration():
                             if len(parts) == 2:
                                 ok, _ = add_to_notion(parts[0], parts[1])
                                 if ok: success_count += 1
-                st.success(f"{success_count}件登録しました。")
+                    # 修正：メッセージの表現を変更
+                    st.success(f"{success_count}件 登録・追記されました。")
             else:
-                st.warning("テキストを入力してください。")
+                st.warning("登録するテキストを入力してください。")
 
     with tab3:
         st.subheader("PDFから用語を自動抽出・登録")
-        
-        # PyPDF2が利用可能かチェック
         if PyPDF2 is None:
-            st.error("⚠️ PDF解析ライブラリ(PyPDF2)がインストールされていません。requirements.txtに記載してデプロイし直してください。")
+            st.error("⚠️ PDF解析用ライブラリ(PyPDF2)がインストールされていません。")
             return
 
         st.write("参考書や資料などのPDFをアップロードすると、AIが重要な用語を読み取ってNotionに自動登録します。")
-        st.caption("※PCのフォルダから複数のPDFをマウスで囲んで、一気にアップロードすることができます。")
         
         uploaded_pdfs = st.file_uploader("PDFファイルをアップロード（複数選択可）", type="pdf", accept_multiple_files=True)
-        
-        chunk_size = st.slider("1回あたりの解析ページ数", min_value=10, max_value=100, value=40, help="一度に数百ページを解析するとAIが用語を見落としやすくなります。推奨の30〜50ページ単位で自動分割して処理します。")
+        chunk_size = st.slider("1回あたりの解析ページ数", 1, 50, 40)
         
         if st.button("PDF解析と自動登録を開始"):
             if not uploaded_pdfs:
@@ -391,80 +375,81 @@ def page_glossary_registration():
             elif not raw_api_key:
                 st.error("OpenAI API Keyが設定されていません。")
             else:
-                total_files = len(uploaded_pdfs)
-                for idx, pdf_file in enumerate(uploaded_pdfs):
-                    st.markdown(f"**📄 {pdf_file.name}** の解析を開始します ({idx+1}/{total_files})")
+                for pdf_file in uploaded_pdfs:
+                    status_area = st.empty()
+                    status_area.info(f"📄 {pdf_file.name} を読み込み中...")
                     
                     try:
                         pdf_reader = PyPDF2.PdfReader(pdf_file)
                         total_pages = len(pdf_reader.pages)
-                        st.info(f"総ページ数: {total_pages}ページ（{chunk_size}ページずつ分割して処理します）")
-                        
+                        total_success_count = 0
+                        successful_term_names = [] 
                         progress_bar = st.progress(0)
                         
-                        for i, start_page in enumerate(range(0, total_pages, chunk_size)):
-                            end_page = min(start_page + chunk_size, total_pages)
-                            with st.spinner(f"ページ {start_page+1} 〜 {end_page} を解析・登録中..."):
-                                
-                                text_chunk = ""
-                                for page_num in range(start_page, end_page):
-                                    extracted_text = pdf_reader.pages[page_num].extract_text()
-                                    if extracted_text:
-                                        text_chunk += extracted_text + "\n"
-                                
-                                if not text_chunk.strip():
-                                    st.warning(f"ページ {start_page+1}〜{end_page}: テキストを抽出できませんでした（スキャン画像などの可能性があります）。")
-                                    progress_bar.progress((end_page) / total_pages)
-                                    continue
-                                
+                        for i in range(0, total_pages, chunk_size):
+                            end_page = min(i + chunk_size, total_pages)
+                            text_chunk = ""
+                            for page_num in range(i, end_page):
+                                text_chunk += pdf_reader.pages[page_num].extract_text() + "\n"
+                            
+                            if not text_chunk.strip(): continue
+                            
+                            with st.spinner(f"{i+1}〜{end_page}ページ目を解析中..."):
                                 prompt = f"""
-                                以下のテキストから、重要な専門用語やキーワードを抽出し、その名称と意味を簡潔にまとめてください。
-                                出力は必ず以下のJSON形式のみで行ってください。他の文章や挨拶は一切含めないでください。
+                                あなたはテレビ局の技術運用・マスター・ファイリング業務に精通した専門職員です。
+                                提供されたテキストから重要な「専門用語」を抽出し、その「意味・解説」をNotionの用語集として作成してください。
+
+                                【絶対条件】
+                                1. テレビ局の職員として、専門的かつ詳細に回答してください。
+                                2. 単なる1行程度の要約ではなく、その用語が「何であるか」に加えて「どのような役割を果たすか」「技術的にどのような背景があるか」を可能な限り詳しく記述してください。
+                                3. 意味のところにわからない名称（略称）があった場合（例：DSやAPSなど）は、推測で展開せず、そのままの略称（DS、APS等）を用いて解説してください。
+                                   （※前提知識：当環境においてDSはData Server、APSはAutomatic Program Control Systemを指すことが多いですが、AIが勝手に書き換えず、原文のニュアンスを維持してください）
+                                4. 推測は厳禁ですが、提供されたテキスト内にある情報は余さず反映させてください。
+
+                                【出力形式】
+                                必ず以下のJSON形式で出力してください。
                                 {{
                                     "terms": [
-                                        {{"名称": "用語名", "意味": "意味の説明"}},
+                                        {{"名称": "用語名", "意味": "詳細な解説テキスト（詳しく記述すること）"}},
                                         ...
                                     ]
                                 }}
-                                
-                                【テキスト】
+
+                                ### 解析対象テキスト
                                 {text_chunk}
                                 """
                                 
-                                try:
-                                    response = openai.chat.completions.create(
-                                        model="gpt-4o-mini",
-                                        response_format={"type": "json_object"},
-                                        messages=[{"role": "user", "content": prompt}],
-                                        temperature=0.3
-                                    )
-                                    
-                                    result_json = json.loads(response.choices[0].message.content)
-                                    terms = result_json.get("terms", [])
-                                    
-                                    if terms:
-                                        success_count = 0
-                                        for term in terms:
-                                            name = term.get("名称", "").strip()
-                                            definition = term.get("意味", "").strip()
-                                            if name and definition:
-                                                ok, _ = add_to_notion(name, definition)
-                                                if ok: success_count += 1
-                                                
-                                        st.success(f"✅ ページ {start_page+1}〜{end_page}: {success_count}件の用語を登録しました！")
-                                    else:
-                                        st.info(f"ページ {start_page+1}〜{end_page}: 登録すべき用語は見つかりませんでした。")
-                                        
-                                except Exception as e:
-                                    st.error(f"AI解析エラー (ページ {start_page+1}〜{end_page}): {e}")
+                                response = openai.chat.completions.create(
+                                    model="gpt-4o",
+                                    response_format={"type": "json_object"},
+                                    messages=[
+                                        {"role": "system", "content": "JSON形式で出力してください。"},
+                                        {"role": "user", "content": prompt}
+                                    ],
+                                )
                                 
-                            progress_bar.progress((end_page) / total_pages)
+                                try:
+                                    result = json.loads(response.choices[0].message.content)
+                                    terms = result.get("terms", [])
+                                    for t in terms:
+                                        ok, msg = add_to_notion(t["名称"], t["意味"])
+                                        if ok and "スキップ" not in msg: 
+                                            total_success_count += 1
+                                            successful_term_names.append(t["名称"]) 
+                                except Exception as e:
+                                    st.warning(f"一部の解析フォーマットエラー: {e}")
+                            
+                            progress_bar.progress(end_page / total_pages)
+                        
+                        status_area.success(f"✅ {pdf_file.name} の処理完了！ 合計 {total_success_count}件 の用語を登録・追記しました。")
+                        
+                        if successful_term_names:
+                            st.markdown("**📝 登録・追記された用語一覧:**")
+                            st.write(", ".join(successful_term_names))
                             
                     except Exception as e:
-                        st.error(f"ファイル読み込みエラー ({pdf_file.name}): {e}")
-                        
+                        st.error(f"エラーが発生しました ({pdf_file.name}): {e}")
                 st.balloons()
-                st.success("🎉 すべてのPDFの解析とNotionへの登録が完了しました！")
 
 # --- メインレイアウト ---
 st.set_page_config(page_title="お仕事支援マルチツール", layout="wide")
@@ -472,15 +457,18 @@ st.set_page_config(page_title="お仕事支援マルチツール", layout="wide"
 with st.sidebar:
     st.title("🛠️ Menu")
     selection = st.radio("機能選択", ["AIマニュアル作成", "用語検索", "用語登録"])
+    
     st.divider()
-    if NOTION_TOKEN and DATABASE_ID: st.success("Notion Connected")
-    else: st.error("Notion Disconnected")
-    if raw_api_key: st.success("OpenAI Ready")
-    else: st.error("OpenAI API Key Missing")
+    if NOTION_TOKEN and DATABASE_ID:
+        st.success("Notion Connected")
+    else:
+        st.error("Notion Disconnected")
+        
+    if raw_api_key:
+        st.success("OpenAI Ready")
+    else:
+        st.error("OpenAI API Key Missing")
 
-if selection == "AIマニュアル作成":
-    page_manual_creator()
-elif selection == "用語検索":
-    page_glossary_search()
-elif selection == "用語登録":
-    page_glossary_registration()
+if selection == "AIマニュアル作成": page_manual_creator()
+elif selection == "用語検索": page_glossary_search()
+elif selection == "用語登録": page_glossary_registration()
