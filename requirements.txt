@@ -6,3 +6,4 @@ openai
 python-docx
 opencv-python-headless
 PyPDF2
+pdfplumber
