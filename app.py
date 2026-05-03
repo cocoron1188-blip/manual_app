@@ -34,23 +34,7 @@ MANUAL_DB_ID = os.getenv("NOTION_MANUAL_DB_ID") # マニュアル用DB
 raw_api_key = os.getenv("OPENAI_API_KEY")
 
 # --- Google Drive 設定 ---
-# --- Google Drive 設定 ---
-def get_gdrive_service():
-    # 1. Streamlit Secrets (クラウド用)
-    if "gcp_service_account" in st.secrets:
-        creds = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
-    # 2. ローカルファイル (Macでの開発用)
-    else:
-        try:
-            creds = service_account.Credentials.from_service_account_file("googledrive_key.json")
-        except FileNotFoundError:
-            return None
-    
-    return build('drive', 'v3', credentials=creds)
-
-# サービスを使える状態にする
-drive_service = get_gdrive_service()
-GDRIVE_FOLDER_ID = "1v5wXyLbX85AiYwCAcQCk0x3ID09bGQAO"
+GOOGLE_SERVICE_ACCOUNT_JSON = "googledrive_key.json" 
 GDRIVE_FOLDER_ID = "1v5wXyLbX85AiYwCAcQcKOx3ID09bGQAP" # ★ここにご自身のフォルダIDを入力してください
 
 # OpenAI API Keyの設定
@@ -270,21 +254,25 @@ def add_to_notion(name, definition):
 
 @st.cache_data(ttl=60)
 def get_gdrive_manuals():
-    if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_JSON):
-        st.error(f"認証ファイル {GOOGLE_SERVICE_ACCOUNT_JSON} が見つかりません。同じフォルダに配置してください。")
-        return {}
-    try:
-        scopes = ['https://www.googleapis.com/auth/drive.readonly']
-        creds = service_account.Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_JSON, scopes=scopes)
+    # --- ここから追加：クラウド用の認証チェック ---
+    if "gcp_service_account" in st.secrets:
+        # Secretsに鍵があれば、それを使って認証
+        creds = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
         service = build('drive', 'v3', credentials=creds)
+    # --- ここまで追加 ---
 
-        query = f"'{GDRIVE_FOLDER_ID}' in parents and mimeType = 'application/vnd.google-apps.document' and trashed = false"
-        results = service.files().list(q=query, fields="files(id, name)").execute()
-        files = results.get('files', [])
-        return {f['name']: f['id'] for f in files}
-    except Exception as e:
-        st.error(f"Googleドライブのデータ取得中にエラーが発生しました: {e}")
-        return {}
+    # --- 以下は元のコードをそのまま活かす（ローカル用） ---
+    else:
+        if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_JSON):
+            st.error(f"認証ファイル {GOOGLE_SERVICE_ACCOUNT_JSON} が見つかりません。")
+            return {}
+        try:
+            scopes = ['https://www.googleapis.com/auth/drive.readonly']
+            creds = service_account.Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_JSON, scopes=scopes)
+            service = build('drive', 'v3', credentials=creds)
+        except Exception as e:
+            st.error(f"認証エラー: {e}")
+            return {}
 
 # --- ページコンテンツ ---
 
