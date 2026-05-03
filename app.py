@@ -34,7 +34,23 @@ MANUAL_DB_ID = os.getenv("NOTION_MANUAL_DB_ID") # マニュアル用DB
 raw_api_key = os.getenv("OPENAI_API_KEY")
 
 # --- Google Drive 設定 ---
-GOOGLE_SERVICE_ACCOUNT_JSON = "googledrive_key.json" 
+# --- Google Drive 設定 ---
+def get_gdrive_service():
+    # 1. Streamlit Secrets (クラウド用)
+    if "gcp_service_account" in st.secrets:
+        creds = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
+    # 2. ローカルファイル (Macでの開発用)
+    else:
+        try:
+            creds = service_account.Credentials.from_service_account_file("googledrive_key.json")
+        except FileNotFoundError:
+            return None
+    
+    return build('drive', 'v3', credentials=creds)
+
+# サービスを使える状態にする
+drive_service = get_gdrive_service()
+GDRIVE_FOLDER_ID = "1v5wXyLbX85AiYwCAcQCk0x3ID09bGQAO"
 GDRIVE_FOLDER_ID = "1v5wXyLbX85AiYwCAcQcKOx3ID09bGQAP" # ★ここにご自身のフォルダIDを入力してください
 
 # OpenAI API Keyの設定
